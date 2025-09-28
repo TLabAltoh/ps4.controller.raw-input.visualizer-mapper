@@ -24,6 +24,7 @@ The program is intended as a developer / hobby tool for experimenting with contr
 * **Virtual keyboard controls:** Left stick to move selection, Cross to press, Square toggles sticky Shift, Circle = Backspace, Triangle = Space.
 * **ESC** quits the program. Pressing `v`/`k` on the physical keyboard will also switch to Visualizer/Virtual Keyboard respectively.
 * `R1` toggles the console window visibility (show/hide). The console is kept always-on-top.
+* `R3` switches IME modes when the virtual keyboard is enabled.
 
 ---
 
@@ -136,7 +137,7 @@ Mappings (Visualizer mode):
   R2 -> Left mouse button, L2 -> Right mouse button
 Controls:
 Mode: VisualizerTAB to toggle Visualizer/Virtual Keyboard | OPTIONS button toggles too
-  In Virtual Keyboard: Left stick to move, Cross to press, Square toggles Shift, Circle Backspace, Triangle Space
+  In Virtual Keyboard: Left stick to move, Cross(X) to press, Square toggles Shift, Circle Backspace, Triangle Space, L3 JA/EN toggle
 
 Mode: Visualizer
 Left Stick:                   Right Stick:                  L2: [..........]   0
@@ -169,3 +170,4 @@ Common places to change functionality in the source:
 * `processVisualizerMapping()` / `processVirtualKeyboard()` — change how sticks/triggers/buttons are interpreted.
 * `getVkForLabel()` — add or adapt punctuation/OEM mappings for your locale.
 * Mouse sensitivity and deadzones are set in `processRightStickMouse()` and can be adjusted there.
+

@@ -523,6 +523,7 @@ private:
         bool cross  = (r.buttons1 & 0x20) != 0;
         bool circle = (r.buttons1 & 0x40) != 0;
         bool tri    = (r.buttons1 & 0x80) != 0;
+        bool l3     = (r.buttons2 & 0x40) != 0;
 
         float lx = normalizeAxis(r.leftStickX);
         float ly = normalizeAxis(r.leftStickY);
@@ -553,11 +554,15 @@ private:
         if (tri && !controllerPrev["TRIANGLE"]) {
             pressVirtualKeyByLabel("SPACE");
         }
+        if (l3 && !prevL3) {
+            toggleImeMode();
+        }
 
         controllerPrev["CROSS"] = cross;
         controllerPrev["SQUARE"] = square;
         controllerPrev["CIRCLE"] = circle;
         controllerPrev["TRIANGLE"] = tri;
+        prevL3 = l3;
     }
 
     void moveVKSelection(int dx, int dy) {
@@ -731,7 +736,7 @@ private:
         std::cout << "  R2 -> Left mouse button, L2 -> Right mouse button\n";
         std::cout << "Controls:\n";
         std::cout << "  ESC to exit | TAB to toggle Visualizer/Virtual Keyboard | OPTIONS button toggles too\n";
-        std::cout << "  In Virtual Keyboard: Left stick to move, Cross(X) to press, Square toggles Shift, Circle Backspace, Triangle Space\n\n";
+        std::cout << "  In Virtual Keyboard: Left stick to move, Cross(X) to press, Square toggles Shift, Circle Backspace, Triangle Space, L3 JA/EN toggle\n\n";
         std::cout.flush();
     }
 
@@ -766,7 +771,7 @@ private:
         } else {
             drawVirtualKeyboard(0, 10);
             console.writeAt(0, 18 + vkRows + 1, "Shift (Square): " + std::string(shiftSticky ? "ON" : "OFF"));
-            console.writeAt(0, 20 + vkRows + 1, "Press Cross to send selected key. Circle = Backspace, Triangle = Space. TAB/OPTIONS toggles mode.");
+            console.writeAt(0, 20 + vkRows + 1, "Press Cross to send selected key. Circle = Backspace, Triangle = Space, L3 = JA/EN toggle. TAB/OPTIONS toggles mode.");
             console.writeAt(0, 22 + vkRows + 1, "Last mouse move: X=" + std::to_string(lastMouseMoveX) + " Y=" + std::to_string(lastMouseMoveY));
             constexpr size_t HEX_DUMP_BYTES = 24;
             console.writeAt(0, 24 + vkRows + 1, "Raw Data: " + Console::bytesToHex(reinterpret_cast<const uint8_t*>(&r), (std::min)(sizeof(r), HEX_DUMP_BYTES)));
@@ -948,11 +953,17 @@ private:
 
     bool shiftSticky = false;
     bool shiftHeldByEmulator = false;
+    bool prevL3 = false;
 
     std::vector<WORD> repeatKeys = { VK_KEY_W, VK_KEY_A, VK_KEY_S, VK_KEY_D, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT };
     std::map<WORD, std::chrono::steady_clock::time_point> repeatNextTime;
     int repeatInitialDelayMs = 300;
     int repeatIntervalMs = 70;
+    
+    void toggleImeMode() {
+        Emu::sendKey(VK_KANJI, true);
+        Emu::sendKey(VK_KANJI, false);
+    }
 };
 
 // helper: virtual key constants for arrows (already in WinAPI)

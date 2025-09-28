@@ -1,6 +1,3 @@
-// main_fixed_refactored.cpp
-// Compile with: cl /EHsc main_fixed_refactored.cpp /link user32.lib
-
 #include <windows.h>
 #include <iostream>
 #include <iomanip>
@@ -435,6 +432,7 @@ private:
             processVisualizerMapping(r);
         }
 
+        processDPadMapping(r);
         processTriggerMapping(r);
         processRightStickMouse(r);
     }
@@ -455,6 +453,14 @@ private:
         setKeyState(VK_KEY_A, wantA);
         setKeyState(VK_KEY_D, wantD);
 
+        handleFaceButton("SQUARE",   (r.buttons1 & 0x10) != 0);
+        handleFaceButton("CROSS",    (r.buttons1 & 0x20) != 0);
+        handleFaceButton("CIRCLE",   (r.buttons1 & 0x40) != 0);
+        handleFaceButton("TRIANGLE", (r.buttons1 & 0x80) != 0);
+    }
+
+    void processDPadMapping(const PS4ControllerReport& r) {
+        // Keep D-Pad -> Arrow key mapping active while in Virtual Keyboard mode
         uint8_t dpad = r.buttons1 & 0x0F;
         bool up = false, down = false, left = false, right = false;
         switch (dpad) {
@@ -472,11 +478,6 @@ private:
         setKeyState(VK_DOWN, down);
         setKeyState(VK_LEFT, left);
         setKeyState(VK_RIGHT, right);
-
-        handleFaceButton("SQUARE",   (r.buttons1 & 0x10) != 0);
-        handleFaceButton("CROSS",    (r.buttons1 & 0x20) != 0);
-        handleFaceButton("CIRCLE",   (r.buttons1 & 0x40) != 0);
-        handleFaceButton("TRIANGLE", (r.buttons1 & 0x80) != 0);
     }
 
     void processTriggerMapping(const PS4ControllerReport& r) {
@@ -552,25 +553,6 @@ private:
         if (tri && !controllerPrev["TRIANGLE"]) {
             pressVirtualKeyByLabel("SPACE");
         }
-
-        // Keep D-Pad -> Arrow key mapping active while in Virtual Keyboard mode
-        uint8_t dpad = r.buttons1 & 0x0F;
-        bool up = false, down = false, left = false, right = false;
-        switch (dpad) {
-            case 0: up = true; break;
-            case 1: up = true; right = true; break;
-            case 2: right = true; break;
-            case 3: right = true; down = true; break;
-            case 4: down = true; break;
-            case 5: down = true; left = true; break;
-            case 6: left = true; break;
-            case 7: left = true; up = true; break;
-            default: break;
-        }
-        setKeyState(VK_UP, up);
-        setKeyState(VK_DOWN, down);
-        setKeyState(VK_LEFT, left);
-        setKeyState(VK_RIGHT, right);
 
         controllerPrev["CROSS"] = cross;
         controllerPrev["SQUARE"] = square;

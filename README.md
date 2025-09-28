@@ -23,6 +23,7 @@ The program is intended as a developer / hobby tool for experimenting with contr
   * Face buttons → configurable VK mappings (defaults shown below)
 * **Virtual keyboard controls:** Left stick to move selection, Cross to press, Square toggles sticky Shift, Circle = Backspace, Triangle = Space.
 * **ESC** quits the program. Pressing `v`/`k` on the physical keyboard will also switch to Visualizer/Virtual Keyboard respectively.
+* `R1` toggles the console window visibility (show/hide). The console is kept always-on-top.
 
 ---
 
@@ -97,6 +98,7 @@ This produces `main.exe`.
 2. Launch the executable from a console window.
 3. Move sticks and press buttons — the console updates continuously with a visualization and mapping state.
 4. Toggle between **Visualizer** and **Virtual Keyboard** with `TAB` or by pressing the controller `OPTIONS` button. Press `ESC` to exit.
+5. Press `R1` to hide/show the console window at any time.
 
 ---
 
@@ -107,7 +109,11 @@ This produces `main.exe`.
 * **SendInput:** keyboard and mouse events are generated with `SendInput`. This may be restricted by security or anti-cheat systems; synthetic input can be blocked or flagged by some applications.
 * **Mouse movement:** right stick movement is scaled with a cubic curve for finer low-speed control and multiplied by a `sensitivity` constant.
 * **Shift sticky:** when sticky Shift is enabled, the program holds `VK_LSHIFT` down until toggled off — this prevents rapid key-up/down behavior for shifted characters.
-* **DPI:** `SetProcessDPIAware()` is commented out; because the code uses relative mouse movement, cursor movement should be DPI-independent. Uncomment if you observe scaling issues on high-DPI displays.
+* **Console window:** the console is set always-on-top on startup. Press `R1` to hide/show it.
+* **Key repeat:** `W/A/S/D` and Arrow keys auto-repeat while held (initial 300 ms, then every 70 ms).
+* **Mouse event coalescing:** uses `MOUSEEVENTF_MOVE_NOCOALESCE` to improve responsiveness of relative mouse movement.
+* **Triggers:** L2 and R2 map to right/left click when pressed past a threshold (default ≈ 50/255).
+* **Threading:** a background message thread owns a message-only window and receives Raw Input; the main thread performs mapping and console rendering to keep output single-threaded.
 
 ---
 
@@ -151,7 +157,7 @@ Raw Data: 01 34 3d eb cb 48 08 58 00 ae 4e c5 00 c7 ff fe ff fb ff 54 03 29 21 1
 
 ## License
 
-This project is released under the **MIT License**. See the `LICENSE` file for details.
+This project is released under the **MIT License**. See the `LICENSE.md` file for details.
 
 ---
 

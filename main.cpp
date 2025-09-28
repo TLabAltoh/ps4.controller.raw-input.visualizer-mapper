@@ -1,3 +1,6 @@
+// main_fixed_refactored.cpp
+// Compile with: cl /EHsc main_fixed_refactored.cpp /link user32.lib
+
 #include <windows.h>
 #include <iostream>
 #include <iomanip>
@@ -549,6 +552,25 @@ private:
         if (tri && !controllerPrev["TRIANGLE"]) {
             pressVirtualKeyByLabel("SPACE");
         }
+
+        // Keep D-Pad -> Arrow key mapping active while in Virtual Keyboard mode
+        uint8_t dpad = r.buttons1 & 0x0F;
+        bool up = false, down = false, left = false, right = false;
+        switch (dpad) {
+            case 0: up = true; break;
+            case 1: up = true; right = true; break;
+            case 2: right = true; break;
+            case 3: right = true; down = true; break;
+            case 4: down = true; break;
+            case 5: down = true; left = true; break;
+            case 6: left = true; break;
+            case 7: left = true; up = true; break;
+            default: break;
+        }
+        setKeyState(VK_UP, up);
+        setKeyState(VK_DOWN, down);
+        setKeyState(VK_LEFT, left);
+        setKeyState(VK_RIGHT, right);
 
         controllerPrev["CROSS"] = cross;
         controllerPrev["SQUARE"] = square;

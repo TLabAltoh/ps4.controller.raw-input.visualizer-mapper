@@ -16,6 +16,11 @@
 #include <map>
 #include <algorithm>
 #include <cctype>
+#include <atomic>
+
+#ifndef MOUSEEVENTF_MOVE_NOCOALESCE
+#define MOUSEEVENTF_MOVE_NOCOALESCE 0x2000
+#endif
 
 #pragma pack(push, 1)
 struct PS4ControllerReport {
@@ -111,7 +116,8 @@ namespace Emu {
         in.type = INPUT_MOUSE;
         in.mi.dx = dx;
         in.mi.dy = dy;
-        in.mi.dwFlags = MOUSEEVENTF_MOVE;
+        // Use NOCOALESCE to improve responsiveness (don't let OS coalesce successive relative moves)
+        in.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE;
         SendInput(1, &in, sizeof(in));
     }
 
@@ -129,39 +135,47 @@ class PS4VisualizerMapper {
 public:
     PS4VisualizerMapper()
     {
-        registerWindowClass();
-        createMessageWindow();
-        registerRawInput();
+        // start the message thread which creates the message-only window and registers raw input
+        msgThread = std::thread(&PS4VisualizerMapper::messageThreadProc, this);
+
+        // wait a short time for message thread to create window / register raw input
+        auto start = std::chrono::steady_clock::now();
+        while (msgThreadId.load() == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) break;
+        }
+
         console.clear();
         initFaceButtonMap();
         initVirtualKeyboard();
         printHeader();
+
+        // Ensure console is topmost on startup (Keep console always on top)
+        setConsoleAlwaysOnTop();
     }
 
     ~PS4VisualizerMapper() {
-        RAWINPUTDEVICE removeRid{};
-        removeRid.usUsagePage = 0x01;
-        removeRid.usUsage = 0x05;
-        removeRid.dwFlags = RIDEV_REMOVE;
-        removeRid.hwndTarget = nullptr;
-        RegisterRawInputDevices(&removeRid, 1, sizeof(removeRid));
+        // request message thread to quit
+        if (msgThreadId.load() != 0) {
+            // post WM_QUIT to the message thread so it exits its GetMessage loop
+            PostThreadMessage(msgThreadId.load(), WM_QUIT, 0, 0);
+        }
+
+        if (msgThread.joinable()) msgThread.join();
 
         // ensure any held inputs are released
         releaseAllInputs();
-
-        if (hwnd) DestroyWindow(hwnd);
-        UnregisterClassW(windowClassName.c_str(), GetModuleHandle(nullptr));
     }
 
     void run() {
-        MSG msg;
         bool done = false;
         while (!done) {
             if (_kbhit()) {
                 int ch = _getch();
                 // Check for special key prefix
                 if (ch == 0 || ch == 0xE0) {
-                    int special = _getch(); // fetch actual code
+                    int special = _getch(); // fetch actual code (ignored)
+                    (void)special;
                 } else {
                     if (ch == 27) { // ESC
                         done = true;
@@ -177,24 +191,49 @@ public:
                     }
                 }
             }
-            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
+
+            // If the message thread has produced a report, process it on the main thread.
+            if (newReportAvailable.exchange(false)) {
+                std::optional<PS4ControllerReport> snapshot;
+                {
+                    std::lock_guard<std::mutex> lk(stateMutex);
+                    snapshot = lastReport;
+                }
+                if (snapshot.has_value()) {
+                    // now process mapping & update display on main thread (keeps console writes single-threaded)
+                    processMapping(snapshot.value());
+                    updateDisplay();
+                }
             }
 
             // handle repeats for WASD and arrow keys
             handleKeyRepeats();
 
-            // update display occasionally (we update on input too)
-            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            // ---- Faster update rate (was 16ms) ----
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
         }
+
+        // on exit, ensure message thread exits
+        if (msgThreadId.load() != 0) {
+            PostThreadMessage(msgThreadId.load(), WM_QUIT, 0, 0);
+        }
+        if (msgThread.joinable()) msgThread.join();
+
         // on exit, release any held keys/buttons
         releaseAllInputs();
     }
 
 private:
-    // Window / raw input setup
-    void registerWindowClass() {
+    // ---------- Message thread and raw input ----------
+    std::thread msgThread;
+    std::atomic<DWORD> msgThreadId{0};
+    std::atomic<bool> newReportAvailable{false};
+
+    void messageThreadProc() {
+        // Save thread id for cross-thread signaling
+        msgThreadId.store(GetCurrentThreadId());
+
+        // Register window class (do this in the message thread)
         WNDCLASSW wc{};
         wc.lpfnWndProc = WindowProc;
         wc.hInstance = GetModuleHandle(nullptr);
@@ -204,18 +243,25 @@ private:
         if (!RegisterClassW(&wc)) {
             DWORD err = GetLastError();
             if (err != ERROR_CLASS_ALREADY_EXISTS) {
-                throw std::runtime_error("RegisterClass failed: " + std::to_string(err));
+                // can't throw in a thread safely; print to stderr and return
+                std::cerr << "RegisterClass failed in message thread: " << err << std::endl;
+                return;
             }
         }
-    }
 
-    void createMessageWindow() {
-        hwnd = CreateWindowW(windowClassName.c_str(), L"PS4RawInputHiddenWindow",
+        // create message-only window in this thread
+        HWND localHwnd = CreateWindowW(windowClassName.c_str(), L"PS4RawInputHiddenWindow",
                              0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandle(nullptr), this);
-        if (!hwnd) throw std::runtime_error("CreateWindow failed");
-    }
+        if (!localHwnd) {
+            std::cerr << "CreateWindow failed in message thread\n";
+            UnregisterClassW(windowClassName.c_str(), GetModuleHandle(nullptr));
+            return;
+        }
 
-    void registerRawInput() {
+        // store hwnd (safe; main thread will only read msgThreadId/hwnd when joined or posting quit)
+        hwnd = localHwnd;
+
+        // register raw input for gamepad
         RAWINPUTDEVICE rid{};
         rid.usUsagePage = 0x01; // Generic Desktop
         rid.usUsage = 0x05;     // Game Pad
@@ -224,35 +270,59 @@ private:
 
         if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
             DWORD err = GetLastError();
-            throw std::runtime_error("RegisterRawInputDevices failed: " + std::to_string(err));
+            std::cerr << "RegisterRawInputDevices failed in message thread: " << err << std::endl;
+            // continue: the loop still allows cleanup and exits
         }
+
+        // run message loop (GetMessage will create a message queue for this thread)
+        MSG msg;
+        while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        // cleanup: remove registration (RIDEV_REMOVE)
+        RAWINPUTDEVICE removeRid{};
+        removeRid.usUsagePage = 0x01;
+        removeRid.usUsage = 0x05;
+        removeRid.dwFlags = RIDEV_REMOVE;
+        removeRid.hwndTarget = nullptr;
+        RegisterRawInputDevices(&removeRid, 1, sizeof(removeRid));
+
+        if (hwnd) {
+            DestroyWindow(hwnd);
+            hwnd = nullptr;
+        }
+        UnregisterClassW(windowClassName.c_str(), GetModuleHandle(nullptr));
     }
 
-    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // Window / raw input setup - WindowProc stays static
+    static LRESULT CALLBACK WindowProc(HWND hwndLocal, UINT msg, WPARAM wParam, LPARAM lParam) {
         PS4VisualizerMapper* self = nullptr;
         if (msg == WM_CREATE) {
             CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
             self = reinterpret_cast<PS4VisualizerMapper*>(cs->lpCreateParams);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+            SetWindowLongPtrW(hwndLocal, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
         } else {
-            self = reinterpret_cast<PS4VisualizerMapper*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            self = reinterpret_cast<PS4VisualizerMapper*>(GetWindowLongPtrW(hwndLocal, GWLP_USERDATA));
         }
 
         if (self) return self->handleMessage(msg, wParam, lParam);
-        return DefWindowProcW(hwnd, msg, wParam, lParam);
+        return DefWindowProcW(hwndLocal, msg, wParam, lParam);
     }
 
     LRESULT handleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (msg) {
             case WM_INPUT:
-                handleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
+                handleRawInputMessageThread(reinterpret_cast<HRAWINPUT>(lParam));
                 return 0;
             default:
                 return DefWindowProc(hwnd, msg, wParam, lParam);
         }
     }
 
-    void handleRawInput(HRAWINPUT hRaw) {
+    // This function runs on the message thread: store the latest report and notify main thread.
+    void handleRawInputMessageThread(HRAWINPUT hRaw) {
         UINT size = 0;
         if (GetRawInputData(hRaw, RID_INPUT, nullptr, &size, sizeof(RAWINPUTHEADER)) == (UINT)-1) return;
         if (size == 0) return;
@@ -272,33 +342,27 @@ private:
                 lastReport = report;
                 controllerConnected = true;
             }
-
-            // process mapping immediately (so input emulation is reactive)
-            processMapping(report);
-            // update UI
-            updateDisplay();
+            // *do not* call processMapping() or updateDisplay() here.
+            // Just mark we have a new report for the main thread to pick up.
+            newReportAvailable.store(true);
         }
     }
 
-    // ---------- Mapping logic ----------
+    // ---------- Mapping logic (unchanged except mapping is executed on main thread) ----------
     static float normalizeAxis(uint8_t v) {
-        // center roughly 128 -> map to [-1, +1]
         return (static_cast<int>(v) - 128) / 127.0f;
     }
 
-    // helper constants for WASD virtual keys
     static constexpr WORD VK_KEY_W = 0x57; // 'W'
     static constexpr WORD VK_KEY_A = 0x41; // 'A'
     static constexpr WORD VK_KEY_S = 0x53; // 'S'
     static constexpr WORD VK_KEY_D = 0x44; // 'D'
 
-    // modes
     enum Mode {
         MODE_VISUALIZER = 0,
         MODE_VKEYBOARD  = 1
     };
 
-    // ---------- Mapping state ----------
     void initFaceButtonMap() {
         faceButtonMap = {
             {"SQUARE", 'E'},     // Example: Square -> 'E'
@@ -306,7 +370,6 @@ private:
             {"CIRCLE", VK_LCONTROL}, // Circle -> Left Ctrl
             {"TRIANGLE", VK_LSHIFT}  // Triangle -> Left Shift
         };
-        // initialize faceButtonState and controllerPrev
         faceButtonState.clear();
         controllerPrev.clear();
         faceButtonState["SQUARE"] = false;
@@ -321,7 +384,6 @@ private:
     }
 
     void initVirtualKeyboard() {
-        // Simple QWERTY-like compact layout
         vkLayout = {
             {"Q","W","E","R","T","Y","U","I","O","P"},
             {"A","S","D","F","G","H","J","K","L","ENTER"},
@@ -331,14 +393,13 @@ private:
         vkRows = static_cast<int>(vkLayout.size());
         selRow = 0;
         selCol = 0;
-        vkMoveDelayMs = 150; // ms between selection moves while holding stick
+        vkMoveDelayMs = 150;
         lastVKMove = std::chrono::steady_clock::now();
         shiftSticky = false;
         shiftHeldByEmulator = false;
         mode = MODE_VISUALIZER;
     }
 
-    // Helper to update a mapped face button (used in visualizer mode)
     void handleFaceButton(const std::string& name, bool pressed) {
         WORD vk = faceButtonMap[name];
         bool currentlyDown = faceButtonState[name];
@@ -353,28 +414,33 @@ private:
     }
 
     void processMapping(const PS4ControllerReport& r) {
-        // OPTIONS button toggles mode on rising edge
         bool optionsPressed = (r.buttons2 & 0x20) != 0;
         if (optionsPressed && !prevOptions) {
             toggleMode();
         }
         prevOptions = optionsPressed;
-        // If in keyboard mode, handle virtual keyboard mapping
+
+        bool r1Pressed = (r.buttons2 & 0x02) != 0;
+        if (r1Pressed && !prevR1) {
+            toggleConsoleWindow();
+        }
+        prevR1 = r1Pressed;
+
         if (mode == MODE_VKEYBOARD) {
             processVirtualKeyboard(r);
         } else {
             processVisualizerMapping(r);
         }
-        // Right stick -> mouse remains available in both modes
+
+        processTriggerMapping(r);
         processRightStickMouse(r);
     }
 
     void processVisualizerMapping(const PS4ControllerReport& r) {
-        // left stick to WASD
-        const float deadzone = 0.25f; // axis below this = not pressed
+        const float deadzone = 0.25f;
         float lx = normalizeAxis(r.leftStickX);
         float ly = normalizeAxis(r.leftStickY);
-        ly = -ly; // conventional forward mapping (stick up -> positive)
+        ly = -ly;
 
         bool wantW = (ly > deadzone);
         bool wantS = (ly < -deadzone);
@@ -386,7 +452,6 @@ private:
         setKeyState(VK_KEY_A, wantA);
         setKeyState(VK_KEY_D, wantD);
 
-        // D-Pad -> arrow keys
         uint8_t dpad = r.buttons1 & 0x0F;
         bool up = false, down = false, left = false, right = false;
         switch (dpad) {
@@ -398,32 +463,32 @@ private:
             case 5: down = true; left = true; break;
             case 6: left = true; break;
             case 7: left = true; up = true; break;
-            default: break; // neutral
+            default: break;
         }
         setKeyState(VK_UP, up);
         setKeyState(VK_DOWN, down);
         setKeyState(VK_LEFT, left);
         setKeyState(VK_RIGHT, right);
 
-        // Triggers as mouse buttons: R2 -> left click, L2 -> right click
-        const uint8_t pressThreshold = 50; // 0..255
-        bool wantLeftClick = r.rightTrigger > pressThreshold;
-        bool wantRightClick = r.leftTrigger > pressThreshold;
-        setMouseButtonState(true, wantLeftClick);  // left
-        setMouseButtonState(false, wantRightClick); // right
-
-        // Face buttons mapping
         handleFaceButton("SQUARE",   (r.buttons1 & 0x10) != 0);
         handleFaceButton("CROSS",    (r.buttons1 & 0x20) != 0);
         handleFaceButton("CIRCLE",   (r.buttons1 & 0x40) != 0);
         handleFaceButton("TRIANGLE", (r.buttons1 & 0x80) != 0);
     }
 
+    void processTriggerMapping(const PS4ControllerReport& r) {
+        const uint8_t pressThreshold = 50;
+        bool wantLeftClick = r.rightTrigger > pressThreshold;
+        bool wantRightClick = r.leftTrigger > pressThreshold;
+        setMouseButtonState(true, wantLeftClick);
+        setMouseButtonState(false, wantRightClick);
+    }
+
     void processRightStickMouse(const PS4ControllerReport& r) {
         float rx = normalizeAxis(r.rightStickX);
         float ry = normalizeAxis(r.rightStickY);
-        // apply a small deadzone
-        const float stickDead = 0.12f;
+        // ---- reduced deadzone for more responsive small movements ----
+        const float stickDead = 0.08f;
         int moveX = 0, moveY = 0;
         if (std::fabs(rx) > stickDead || std::fabs(ry) > stickDead) {
             auto scale = [](float v)->float {
@@ -432,7 +497,8 @@ private:
             };
             float sx = scale(rx);
             float sy = scale(ry);
-            const float sensitivity = 14.0f; // pixels per frame at full tilt
+            // ---- increased sensitivity to speed up cursor movement ----
+            const float sensitivity = 36.0f;
             moveX = static_cast<int>(std::round(sx * sensitivity));
             moveY = static_cast<int>(std::round(sy * sensitivity));
             if (moveX == 0 && std::fabs(rx) > stickDead) moveX = (rx > 0) ? 1 : -1;
@@ -448,52 +514,42 @@ private:
         }
     }
 
-    // Virtual keyboard processing
     void processVirtualKeyboard(const PS4ControllerReport& r) {
-        // Detect face button rising edges for virtual keyboard actions
         bool square = (r.buttons1 & 0x10) != 0;
         bool cross  = (r.buttons1 & 0x20) != 0;
         bool circle = (r.buttons1 & 0x40) != 0;
         bool tri    = (r.buttons1 & 0x80) != 0;
 
-        // Move selection with left stick, with a small repeat cooldown
         float lx = normalizeAxis(r.leftStickX);
         float ly = normalizeAxis(r.leftStickY);
-        ly = -ly; // stick up -> positive
+        ly = -ly;
 
         const float vkDead = 0.35f;
         auto now = std::chrono::steady_clock::now();
         auto msSince = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastVKMove).count();
         if (msSince >= vkMoveDelayMs) {
-            // choose dominant direction
             if (std::fabs(lx) > std::fabs(ly)) {
                 if (lx > vkDead) { moveVKSelection(1, 0); lastVKMove = now; }
                 else if (lx < -vkDead) { moveVKSelection(-1, 0); lastVKMove = now; }
             } else {
-                if (ly > vkDead) { moveVKSelection(0, -1); lastVKMove = now; } // up decreases row index
-                else if (ly < -vkDead) { moveVKSelection(0, 1); lastVKMove = now; } // down increases row
+                if (ly > vkDead) { moveVKSelection(0, -1); lastVKMove = now; }
+                else if (ly < -vkDead) { moveVKSelection(0, 1); lastVKMove = now; }
             }
         }
 
-        // Face buttons: use rising edge detection using controllerPrev
-        // Cross: press selected key
         if (cross && !controllerPrev["CROSS"]) {
             pressSelectedVirtualKey();
         }
-        // Square: toggle shift (sticky)
         if (square && !controllerPrev["SQUARE"]) {
             toggleShiftSticky();
         }
-        // Circle: Backspace
         if (circle && !controllerPrev["CIRCLE"]) {
             pressVirtualKeyByLabel("BACKSPACE");
         }
-        // Triangle: Space
         if (tri && !controllerPrev["TRIANGLE"]) {
             pressVirtualKeyByLabel("SPACE");
         }
 
-        // update controllerPrev
         controllerPrev["CROSS"] = cross;
         controllerPrev["SQUARE"] = square;
         controllerPrev["CIRCLE"] = circle;
@@ -501,7 +557,6 @@ private:
     }
 
     void moveVKSelection(int dx, int dy) {
-        // dx >0 move right; dy >0 move down
         int newRow = selRow + dy;
         if (newRow < 0) newRow = 0;
         if (newRow >= vkRows) newRow = vkRows - 1;
@@ -528,10 +583,9 @@ private:
                 return static_cast<WORD>(std::toupper(static_cast<unsigned char>(c)));
             }
             if (std::isdigit(static_cast<unsigned char>(c))) {
-                return static_cast<WORD>(c); // '0'..'9' map to VK 0x30..0x39
+                return static_cast<WORD>(c);
             }
         }
-        // specials
         if (label == "SPACE") return VK_SPACE;
         if (label == "ENTER") return VK_RETURN;
         if (label == "BACKSPACE") return VK_BACK;
@@ -540,17 +594,16 @@ private:
         if (label == "LSHFT" || label == "RSHIFT") return VK_LSHIFT;
         if (label == "LCTRL" || label == "RCTRL") return VK_LCONTROL;
         if (label == "LALT" || label == "RALT") return VK_MENU;
-        // OEM / punctuation
-        if (label == ",") return 0xBC; // VK_OEM_COMMA
-        if (label == ".") return 0xBE; // VK_OEM_PERIOD
-        if (label == "/") return 0xBF; // VK_OEM_2
-        if (label == ";") return 0xBA; // VK_OEM_1
-        if (label == "'") return 0xDE; // VK_OEM_7
-        if (label == "[") return 0xDB; // VK_OEM_4
-        if (label == "]") return 0xDD; // VK_OEM_6
-        if (label == "\\") return 0xDC; // VK_OEM_5
-        if (label == "-") return 0xBD; // VK_OEM_MINUS
-        if (label == "=") return 0xBB; // VK_OEM_PLUS
+        if (label == ",") return 0xBC;
+        if (label == ".") return 0xBE;
+        if (label == "/") return 0xBF;
+        if (label == ";") return 0xBA;
+        if (label == "'") return 0xDE;
+        if (label == "[") return 0xDB;
+        if (label == "]") return 0xDD;
+        if (label == "\\") return 0xDC;
+        if (label == "-") return 0xBD;
+        if (label == "=") return 0xBB;
         return 0;
     }
 
@@ -558,17 +611,11 @@ private:
         WORD vk = getVkForLabel(label);
         if (vk == 0) return;
 
-        // If shiftSticky is enabled and not currently physically held by the system via us,
-        // ensure Shift is held during the press.
         if (shiftSticky) {
-            // Ensure shift key is held by emulator
             setShiftState(true);
-            // send letter key
             Emu::sendKey(vk, true);
             Emu::sendKey(vk, false);
-            // do not clear shiftSticky; it remains until toggled off
         } else {
-            // normal momentary press
             Emu::sendKey(vk, true);
             Emu::sendKey(vk, false);
         }
@@ -589,21 +636,18 @@ private:
         }
     }
 
-    // Track which virtual keys are currently held by us to avoid repeated down events
     void setKeyState(WORD vk, bool wantDown) {
         auto it = keyState.find(vk);
         bool currentlyDown = (it != keyState.end()) ? it->second : false;
         if (wantDown && !currentlyDown) {
             Emu::sendKey(vk, true);
             keyState[vk] = true;
-            // start repeat timer for repeatable keys
             if (std::find(repeatKeys.begin(), repeatKeys.end(), vk) != repeatKeys.end()) {
                 repeatNextTime[vk] = std::chrono::steady_clock::now() + std::chrono::milliseconds(repeatInitialDelayMs);
             }
         } else if (!wantDown && currentlyDown) {
             Emu::sendKey(vk, false);
             keyState[vk] = false;
-            // stop repeating
             repeatNextTime.erase(vk);
         }
     }
@@ -620,7 +664,6 @@ private:
     }
 
     void releaseAllInputs() {
-        // release keys we might be holding
         for (auto &kv : keyState) {
             if (kv.second) {
                 Emu::sendKey(kv.first, false);
@@ -628,7 +671,6 @@ private:
             }
         }
         keyState.clear();
-        // clear any repeat timers/state
         repeatNextTime.clear();
 
         if (mouseLeftDown) {
@@ -648,33 +690,27 @@ private:
             }
         }
 
-        // release shift if emulator is holding it
         if (shiftHeldByEmulator) {
             Emu::sendKey(VK_LSHIFT, false);
             shiftHeldByEmulator = false;
         }
     }
 
-    // Called regularly from run() to synthesize repeated keypresses for held keys
     void handleKeyRepeats() {
         auto now = std::chrono::steady_clock::now();
         for (WORD vk : repeatKeys) {
             auto itState = keyState.find(vk);
             if (itState == keyState.end() || !itState->second) {
-                // not held -> nothing to do
                 continue;
             }
             auto itNext = repeatNextTime.find(vk);
             if (itNext == repeatNextTime.end()) {
-                // schedule initial repeat if somehow missing
                 repeatNextTime[vk] = now + std::chrono::milliseconds(repeatInitialDelayMs);
                 continue;
             }
             if (now >= itNext->second) {
-                // simulate a repeat by sending a quick up->down (keeps our "held" semantic in keyState)
                 Emu::sendKey(vk, false);
                 Emu::sendKey(vk, true);
-                // schedule next repeat
                 itNext->second = now + std::chrono::milliseconds(repeatIntervalMs);
             }
         }
@@ -704,7 +740,6 @@ private:
             snapshot = lastReport;
         }
 
-        // Mode indicator
         console.writeAt(0, 7, std::string("Mode: ") + (mode == MODE_VISUALIZER ? "Visualizer" : "Virtual Keyboard"));
 
         if (!snapshot.has_value()) {
@@ -723,20 +758,19 @@ private:
             console.writeAt(0, 26, "Last mouse move: X=" + std::to_string(lastMouseMoveX) + " Y=" + std::to_string(lastMouseMoveY));
             console.writeAt(0, 27, "Mouse L down: " + std::string(mouseLeftDown ? "YES" : "NO") + "  Mouse R down: " + std::string(mouseRightDown ? "YES" : "NO"));
             constexpr size_t HEX_DUMP_BYTES = 24;
-            console.writeAt(0, 29, "Raw Data: " + Console::bytesToHex(reinterpret_cast<const uint8_t*>(&r), min(sizeof(r), HEX_DUMP_BYTES)));
+            console.writeAt(0, 29, "Raw Data: " + Console::bytesToHex(reinterpret_cast<const uint8_t*>(&r), (std::min)(sizeof(r), HEX_DUMP_BYTES)));
         } else {
-            // Virtual keyboard UI
             drawVirtualKeyboard(0, 10);
             console.writeAt(0, 18 + vkRows + 1, "Shift (Square): " + std::string(shiftSticky ? "ON" : "OFF"));
             console.writeAt(0, 20 + vkRows + 1, "Press Cross to send selected key. Circle = Backspace, Triangle = Space. TAB/OPTIONS toggles mode.");
             console.writeAt(0, 22 + vkRows + 1, "Last mouse move: X=" + std::to_string(lastMouseMoveX) + " Y=" + std::to_string(lastMouseMoveY));
             constexpr size_t HEX_DUMP_BYTES = 24;
-            console.writeAt(0, 24 + vkRows + 1, "Raw Data: " + Console::bytesToHex(reinterpret_cast<const uint8_t*>(&r), min(sizeof(r), HEX_DUMP_BYTES)));
+            console.writeAt(0, 24 + vkRows + 1, "Raw Data: " + Console::bytesToHex(reinterpret_cast<const uint8_t*>(&r), (std::min)(sizeof(r), HEX_DUMP_BYTES)));
         }
     }
 
     void drawStick(int x, int y, uint8_t rawX, uint8_t rawY, const std::string& name) {
-        constexpr int GRID_W = 11; // -5..+5
+        constexpr int GRID_W = 11;
         constexpr int GRID_H = 5;
         constexpr int HALF_W = 5;
         constexpr int HALF_H = 2;
@@ -801,23 +835,19 @@ private:
     }
 
     void drawVirtualKeyboard(int x, int y) {
-        // draw the vkLayout with the selected key highlighted by [label]
         for (int r = 0; r < vkRows; ++r) {
             int colX = x;
             for (size_t c = 0; c < vkLayout[r].size(); ++c) {
                 std::string label = vkLayout[r][c];
                 std::string disp;
-                // pad each key to width 7
                 const int minKeyWidth = 7;
                 if (r == selRow && static_cast<int>(c) == selCol) {
-                    // selected
                     std::ostringstream ss;
                     ss << '[' << label << ']';
                     disp = ss.str();
                 } else {
                     disp = " " + label + " ";
                 }
-                // pad/truncate to minKeyWidth
                 if ((int)disp.size() < minKeyWidth) disp += std::string(minKeyWidth - (int)disp.size(), ' ');
                 console.writeAt(colX, y + r, disp);
                 colX += disp.size() + 1;
@@ -852,10 +882,8 @@ private:
 
     void setMode(Mode m) {
         if (mode == m) return;
-        // switching modes - release inputs to avoid stuck keys/buttons
         releaseAllInputs();
         mode = m;
-        // if entering keyboard mode, ensure selection within bounds
         if (mode == MODE_VKEYBOARD) {
             if (selRow < 0) selRow = 0;
             if (selRow >= vkRows) selRow = vkRows - 1;
@@ -863,6 +891,22 @@ private:
             if (selCol >= static_cast<int>(vkLayout[selRow].size())) selCol = static_cast<int>(vkLayout[selRow].size()) - 1;
         }
         updateDisplay();
+    }
+
+    void toggleConsoleWindow() {
+        HWND hConsole = GetConsoleWindow();
+        if (!hConsole) return;
+        consoleVisible = !consoleVisible;
+        ShowWindow(hConsole, consoleVisible ? SW_SHOW : SW_HIDE);
+        if (consoleVisible) {
+            setConsoleAlwaysOnTop();
+        }
+    }
+
+    void setConsoleAlwaysOnTop() {
+        HWND hConsole = GetConsoleWindow();
+        if (!hConsole) return;
+        SetWindowPos(hConsole, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     }
 
 private:
@@ -875,44 +919,36 @@ private:
 
     Console console;
 
-    // Mapping state
-    std::map<WORD, bool> keyState; // virtual-key -> currently down?
+    std::map<WORD, bool> keyState;
     bool mouseLeftDown = false;
     bool mouseRightDown = false;
     int lastMouseMoveX = 0;
     int lastMouseMoveY = 0;
 
-    // Face button mapping (visualizer)
     std::map<std::string, WORD> faceButtonMap;
     std::map<std::string, bool> faceButtonState;
 
-    // Controller previous button states (for edge detection in VK mode)
     std::map<std::string, bool> controllerPrev;
     bool prevOptions = false;
 
-    // Mode
+    bool prevR1 = false;
+    bool consoleVisible = true;
+
     Mode mode = MODE_VISUALIZER;
 
-    // Virtual keyboard layout and selection
     std::vector<std::vector<std::string>> vkLayout;
     int vkRows = 0;
     int selRow = 0, selCol = 0;
     int vkMoveDelayMs = 150;
     std::chrono::steady_clock::time_point lastVKMove;
 
-    // Shift sticky state in virtual keyboard
     bool shiftSticky = false;
     bool shiftHeldByEmulator = false;
 
-    // --- Repeat support for held keys (WASD + arrows) ---
-    // Keys we want to auto-repeat while held
     std::vector<WORD> repeatKeys = { VK_KEY_W, VK_KEY_A, VK_KEY_S, VK_KEY_D, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT };
-    // Next scheduled repeat time per key
     std::map<WORD, std::chrono::steady_clock::time_point> repeatNextTime;
-    // initial delay and repeat interval (ms)
     int repeatInitialDelayMs = 300;
     int repeatIntervalMs = 70;
-
 };
 
 // helper: virtual key constants for arrows (already in WinAPI)
@@ -924,10 +960,6 @@ private:
 #endif
 
 int main() {
-    // Note: enabling SetProcessDPIAware may be useful if cursor movement appears scaled,
-    // but sending relative moves is DPI-independent. Uncomment if desired:
-    // SetProcessDPIAware();
-
     try {
         PS4VisualizerMapper viz;
         viz.run();
